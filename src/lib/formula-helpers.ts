@@ -10,7 +10,7 @@ const helpers: Record<string, string> = {
   STRLENGTH: '((s)=>s.length)(',
 };
 
-const reverse = new Map(Object.entries(helpers).map(([name, expansion]) => [expansion, `${name}(`]));
+const restorations = new Map(Object.entries(helpers).map(([name, expansion]) => [expansion, `${name}(`]));
 
 export function expandHelpers(formula: string): string {
   return Object.entries(helpers).reduce(
@@ -21,7 +21,7 @@ export function expandHelpers(formula: string): string {
 
 export function restoreHelpers(calculation: string): string {
   let result = calculation;
-  reverse.forEach((original, expansion) => {
+  restorations.forEach((original, expansion) => {
     result = result.replaceAll(expansion, original);
   });
   return result;

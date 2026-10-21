@@ -1,6 +1,6 @@
 import { createApp } from './app.ts';
 import config from './config/index.ts';
-import { closePool } from './data/close-pool.ts';
+import { closeResources } from './lib/close-resources.ts';
 import { shutdown } from './lib/shutdown.ts';
 
 const app = createApp();
@@ -9,7 +9,7 @@ const server = app.listen(config.port, () => {
 });
 
 function handleSignal(signal: NodeJS.Signals): void {
-  shutdown(server, closePool, signal)
+  shutdown(server, closeResources, signal)
     .then(() => {
       process.exit(0);
     })
