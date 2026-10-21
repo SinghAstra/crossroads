@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import config from '../src/config.ts';
+import config from '../src/config/index.ts';
 
 test('loads the test environment against the test database', () => {
   assert.equal(config.env, 'test');
