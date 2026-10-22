@@ -34,6 +34,57 @@ CREATE TABLE IF NOT EXISTS formula_runs (
   status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   inserted_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
+  KEY idx_formula_runs_run_uuid (run_uuid),
+  KEY idx_formula_runs_formula_date (formula_uuid, inserted_at),
+  KEY idx_formula_runs_date_status (inserted_at, status),
   CONSTRAINT chk_formula_runs_version CHECK (formula_version >= 1),
   CONSTRAINT chk_formula_runs_status CHECK (status IN ('SUCCESS', 'FAILED', 'SKIPPED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE OR REPLACE VIEW current_formulas_aggregate AS
+SELECT
+  f.id,
+  f.uuid,
+  f.version,
+  f.name,
+  f.formula_text,
+  f.status,
+  f.created_by,
+  f.first_created_at,
+  f.inserted_at,
+  f.inputs
+FROM formulas AS f
+JOIN (
+  SELECT uuid, MAX(id) AS max_id
+  FROM formulas
+  GROUP BY uuid
+) AS latest ON latest.uuid = f.uuid AND latest.max_id = f.id;
+
+CREATE OR REPLACE VIEW current_formulas_window AS
+SELECT
+  id,
+  uuid,
+  version,
+  name,
+  formula_text,
+  status,
+  created_by,
+  first_created_at,
+  inserted_at,
+  inputs
+FROM (
+  SELECT
+    id,
+    uuid,
+    version,
+    name,
+    formula_text,
+    status,
+    created_by,
+    first_created_at,
+    inserted_at,
+    inputs,
+    ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY id DESC) AS row_number_value
+  FROM formulas
+) AS ranked
+WHERE row_number_value = 1;
