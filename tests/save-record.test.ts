@@ -2,6 +2,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import type { RowDataPacket } from 'mysql2/promise';
+import { AppError } from '../src/lib/app-error.ts';
 import { closePool } from '../src/data/close-pool.ts';
 import pool from '../src/data/pool.ts';
 import { saveRecord, type SavedRecord } from '../src/data/save-record.ts';
@@ -95,4 +96,87 @@ test('saveRecord appends rows for a table without a row version', async () => {
   assert.equal(run.status, 'SUCCESS');
   assert.deepEqual(parsedJson(run.input_json), { amount: 1 });
   assert.equal(parsedJson(run.result), 42);
+});
+
+test('saveRecord inserts an array with one multi-row statement', async () => {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
+  const firstName = `save_array_first_${suffix}`;
+  const secondName = `save_array_second_${suffix}`;
+  const saved = await saveRecord('formulas', [
+    {
+      name: firstName,
+      formula_text: 'return 1',
+      created_by: 'array-test',
+      inputs: ['amount'],
+    },
+    {
+      name: secondName,
+      formula_text: 'return 2',
+      inputs: ['amount'],
+    },
+  ]);
+  assert.equal(saved.length, 2);
+  assert.equal(saved[0]?.name, firstName);
+  assert.equal(saved[1]?.name, secondName);
+  assert.equal(saved[0]?.version, 1);
+  assert.equal(saved[1]?.version, 1);
+  assert.equal(saved[0]?.status, 'ACTIVE');
+  assert.equal(saved[1]?.status, 'ACTIVE');
+  assert.equal(saved[0]?.created_by, 'array-test');
+  assert.equal(saved[1]?.created_by, 'system');
+  assert.equal(saved[1]?.id, Number(saved[0]?.id) + 1);
+});
+
+test('saveRecord rolls back the whole array when one row fails', async () => {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
+  const firstName = `save_rollback_first_${suffix}`;
+  const secondName = `save_rollback_second_${suffix}`;
+  await assert.rejects(
+    saveRecord('formulas', [
+      {
+        name: firstName,
+        formula_text: 'return 1',
+        inputs: ['amount'],
+      },
+      {
+        name: secondName,
+        formula_text: 'return 2',
+      },
+    ]),
+  );
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT COUNT(*) AS count FROM formulas WHERE name IN (?, ?)',
+    [firstName, secondName],
+  );
+  assert.equal(rows[0]?.count, 0);
+});
+
+test('saveRecord maps a duplicate version to a conflict with the current row', async () => {
+  const created = await createTestFormula();
+  let conflict: unknown;
+  try {
+    await saveRecord('formulas', [
+      {
+        uuid: created.uuid,
+        formula_text: 'return 2',
+      },
+      {
+        uuid: created.uuid,
+        formula_text: 'return 3',
+      },
+    ]);
+  } catch (error) {
+    conflict = error;
+  }
+  assert.ok(conflict instanceof AppError);
+  assert.equal(conflict.statusCode, 409);
+  assert.equal(conflict.code, 'VERSION_CONFLICT');
+  const details = conflict.details as { current?: SavedRecord };
+  assert.equal(details.current?.uuid, created.uuid);
+  assert.equal(details.current?.version, 1);
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT COUNT(*) AS count FROM formulas WHERE uuid = ?',
+    [created.uuid],
+  );
+  assert.equal(rows[0]?.count, 1);
 });

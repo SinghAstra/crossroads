@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
 import { AppError } from '../lib/app-error.ts';
 import { ErrorCodes } from '../lib/error-codes.ts';
+import { isDuplicateKeyError } from '../lib/error-guards.ts';
 import pool from './pool.ts';
 import {
   getTableDefinition,
@@ -113,61 +114,160 @@ async function findCurrent(
   return rows[0] ?? null;
 }
 
-async function findById(
+async function findInsertedRows(
   connection: PoolConnection,
   definition: TableDefinition,
-  id: number,
-): Promise<SavedRecord> {
+  firstId: number,
+  count: number,
+): Promise<SavedRecord[]> {
   const table = quoteIdentifier(definition.table);
   const primaryKey = quoteIdentifier(definition.primaryKey);
+  const lastId = firstId + count - 1;
   const [rows] = await connection.query<RowDataPacket[]>(
-    `SELECT * FROM ${table} WHERE ${primaryKey} = ? LIMIT 1`,
-    [id],
+    `SELECT * FROM ${table} WHERE ${primaryKey} BETWEEN ? AND ? ORDER BY ${primaryKey} ASC`,
+    [firstId, lastId],
   );
-  const row = rows[0];
-  if (!row) {
-    throw new AppError(500, ErrorCodes.INTERNAL_ERROR, 'Saved record could not be read back');
+  if (rows.length !== count) {
+    throw new AppError(500, ErrorCodes.INTERNAL_ERROR, 'Saved records could not be read back');
   }
-  return row;
+  return rows;
 }
 
-async function insertValues(
+function duplicateKeyUuid(error: unknown): string | null {
+  if (!(error instanceof Error) || !('sqlMessage' in error)) {
+    return null;
+  }
+  const message = (error as { sqlMessage?: unknown }).sqlMessage;
+  if (typeof message !== 'string') {
+    return null;
+  }
+  const match = /Duplicate entry '(.+)-(\d+)' for key/.exec(message);
+  return match?.[1] ?? null;
+}
+
+async function findConflictCurrent(
   connection: PoolConnection,
   definition: TableDefinition,
-  values: Record<string, unknown>,
-): Promise<SavedRecord> {
-  const columns = Object.keys(values);
-  const placeholders = columns.map(() => '?').join(', ');
-  const quotedColumns = columns.map(quoteIdentifier).join(', ');
-  const parameters = columns.map((column) => (
-    definition.jsonColumns.includes(column) ? serializeJson(values[column]) : values[column]
-  ));
-  const sql = `INSERT INTO ${quoteIdentifier(definition.table)} (${quotedColumns}) VALUES (${placeholders})`;
-  const [result] = await connection.query<ResultSetHeader>(sql, parameters);
-  return findById(connection, definition, result.insertId);
+  rows: Record<string, unknown>[],
+  error: unknown,
+): Promise<SavedRecord | null> {
+  if (definition.versionColumn === null) {
+    return null;
+  }
+  const duplicateUuid = duplicateKeyUuid(error);
+  if (duplicateUuid) {
+    const current = await findCurrent(connection, definition, duplicateUuid);
+    if (current) {
+      return current;
+    }
+  }
+  for (const row of rows) {
+    const uuid = row[definition.uuidColumn];
+    const version = Number(row[definition.versionColumn]);
+    if (typeof uuid !== 'string') {
+      continue;
+    }
+    const current = await findCurrent(connection, definition, uuid);
+    if (current && Number(current[definition.versionColumn]) >= version) {
+      return current;
+    }
+  }
+  return null;
 }
 
-export async function saveRecord(
-  table: TableName,
-  data: Record<string, unknown>,
-  options: SaveRecordOptions = {},
-): Promise<SavedRecord> {
-  const definition = getTableDefinition(table);
-  const ownsConnection = options.connection === undefined;
-  const connection = options.connection ?? (await pool.getConnection());
-  try {
+async function prepareRows(
+  connection: PoolConnection,
+  definition: TableDefinition,
+  items: Record<string, unknown>[],
+): Promise<Record<string, unknown>[]> {
+  const rows: Record<string, unknown>[] = [];
+  for (const item of items) {
     if (definition.versionColumn === null) {
-      return await insertValues(connection, definition, appendValues(data, definition));
+      rows.push(appendValues(item, definition));
+      continue;
     }
-    const uuid = dataUuid(data, definition);
+    const uuid = dataUuid(item, definition);
     if (!uuid) {
-      return await insertValues(connection, definition, createValues(data, definition));
+      rows.push(createValues(item, definition));
+      continue;
     }
     const current = await findCurrent(connection, definition, uuid);
     if (!current) {
       throw new AppError(404, ErrorCodes.NOT_FOUND, 'Record not found', { uuid });
     }
-    return await insertValues(connection, definition, changeValues(data, current, definition));
+    rows.push(changeValues(item, current, definition));
+  }
+  return rows;
+}
+
+async function insertRows(
+  connection: PoolConnection,
+  definition: TableDefinition,
+  rows: Record<string, unknown>[],
+): Promise<SavedRecord[]> {
+  const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  const valuesSql = rows.map((row) => {
+    const placeholders = columns.map((column) => (Object.hasOwn(row, column) ? '?' : 'DEFAULT'));
+    return `(${placeholders.join(', ')})`;
+  }).join(', ');
+  const parameters = rows.flatMap((row) => columns
+    .filter((column) => Object.hasOwn(row, column))
+    .map((column) => (
+      definition.jsonColumns.includes(column) ? serializeJson(row[column]) : row[column]
+    )));
+  const table = quoteIdentifier(definition.table);
+  const quotedColumns = columns.map(quoteIdentifier).join(', ');
+  const sql = `INSERT INTO ${table} (${quotedColumns}) VALUES ${valuesSql}`;
+  const [result] = await connection.query<ResultSetHeader>(sql, parameters);
+  return findInsertedRows(connection, definition, result.insertId, result.affectedRows);
+}
+
+export function saveRecord(
+  table: TableName,
+  data: Record<string, unknown>,
+  options?: SaveRecordOptions,
+): Promise<SavedRecord>;
+export function saveRecord(
+  table: TableName,
+  data: Record<string, unknown>[],
+  options?: SaveRecordOptions,
+): Promise<SavedRecord[]>;
+export async function saveRecord(
+  table: TableName,
+  data: Record<string, unknown> | Record<string, unknown>[],
+  options: SaveRecordOptions = {},
+): Promise<SavedRecord | SavedRecord[]> {
+  const definition = getTableDefinition(table);
+  const items = Array.isArray(data) ? data : [data];
+  if (items.length === 0) {
+    return [];
+  }
+  const ownsConnection = options.connection === undefined;
+  const connection = options.connection ?? (await pool.getConnection());
+  let preparedRows: Record<string, unknown>[] = [];
+  try {
+    await connection.beginTransaction();
+    preparedRows = await prepareRows(connection, definition, items);
+    const savedRows = await insertRows(connection, definition, preparedRows);
+    await connection.commit();
+    const first = savedRows[0];
+    if (!first) {
+      throw new AppError(500, ErrorCodes.INTERNAL_ERROR, 'Saved record could not be read back');
+    }
+    return Array.isArray(data) ? savedRows : first;
+  } catch (error) {
+    await connection.rollback().catch(() => undefined);
+    if (isDuplicateKeyError(error)) {
+      const current = await findConflictCurrent(connection, definition, preparedRows, error).catch(
+        () => null,
+      );
+      if (current) {
+        throw new AppError(409, ErrorCodes.VERSION_CONFLICT, 'A newer version already exists', {
+          current,
+        });
+      }
+    }
+    throw error;
   } finally {
     if (ownsConnection) {
       connection.release();
