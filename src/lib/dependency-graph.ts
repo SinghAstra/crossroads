@@ -119,6 +119,15 @@ export function computeLevels<T extends FormulaNode>(graph: FormulaGraph<T>): T[
     current = [...next];
   }
   if (processed !== graph.formulas.size) {
+    const path = findCyclePath(graph);
+    if (path) {
+      throw new AppError(
+        400,
+        ErrorCodes.DEPENDENCY_CYCLE,
+        `Dependency cycle detected: ${path.join(' -> ')}`,
+        { path },
+      );
+    }
     const remaining = [...graph.formulas.keys()]
       .filter((name) => (indegree.get(name) ?? 0) > 0)
       .sort(compareNames);
@@ -127,4 +136,118 @@ export function computeLevels<T extends FormulaNode>(graph: FormulaGraph<T>): T[
     });
   }
   return levels;
+}
+
+export function findCyclePath<T extends FormulaNode>(graph: FormulaGraph<T>): string[] | null {
+  const state = new Map<string, 1 | 2>();
+  const stack: string[] = [];
+  const stackIndex = new Map<string, number>();
+  const visit = (name: string): string[] | null => {
+    state.set(name, 1);
+    stackIndex.set(name, stack.length);
+    stack.push(name);
+    const dependencies = [...(graph.dependencies.get(name) ?? [])].sort(compareNames);
+    for (const dependency of dependencies) {
+      const dependencyState = state.get(dependency);
+      if (dependencyState === 1) {
+        const start = stackIndex.get(dependency);
+        if (start === undefined) {
+          return [dependency, dependency];
+        }
+        return [...stack.slice(start), dependency];
+      }
+      if (dependencyState === undefined) {
+        const cycle = visit(dependency);
+        if (cycle) {
+          return cycle;
+        }
+      }
+    }
+    stack.pop();
+    stackIndex.delete(name);
+    state.set(name, 2);
+    return null;
+  };
+  const names = [...graph.formulas.keys()].sort(compareNames);
+  for (const name of names) {
+    if (state.has(name)) {
+      continue;
+    }
+    const cycle = visit(name);
+    if (cycle) {
+      return cycle;
+    }
+  }
+  return null;
+}
+
+export function collectMissingInputs<T extends FormulaNode>(graph: FormulaGraph<T>): string[] {
+  const missing = new Set<string>();
+  for (const names of graph.missingInputs.values()) {
+    for (const name of names) {
+      missing.add(name);
+    }
+  }
+  return [...missing].sort(compareNames);
+}
+
+export function assertNoMissingInputs<T extends FormulaNode>(graph: FormulaGraph<T>): void {
+  const missing = collectMissingInputs(graph);
+  if (missing.length > 0) {
+    throw new AppError(400, ErrorCodes.MISSING_INPUT, `Missing inputs: ${missing.join(', ')}`, {
+      missing,
+    });
+  }
+}
+
+export interface ImpactEntry<T extends FormulaNode = FormulaNode> {
+  readonly formula: T;
+  readonly depth: number;
+  readonly path: readonly string[];
+}
+
+interface ImpactQueueEntry {
+  readonly name: string;
+  readonly depth: number;
+  readonly path: readonly string[];
+}
+
+export function findImpact<T extends FormulaNode>(
+  graph: FormulaGraph<T>,
+  targetName: string,
+): ImpactEntry<T>[] {
+  if (!graph.formulas.has(targetName)) {
+    return [];
+  }
+  const visited = new Set<string>([targetName]);
+  const queue: ImpactQueueEntry[] = [{ name: targetName, depth: 0, path: [targetName] }];
+  const impact: ImpactEntry<T>[] = [];
+  let index = 0;
+  while (index < queue.length) {
+    const current = queue[index];
+    index += 1;
+    if (!current) {
+      continue;
+    }
+    const dependents = [...(graph.dependents.get(current.name) ?? [])].sort(compareNames);
+    for (const dependentName of dependents) {
+      if (visited.has(dependentName)) {
+        continue;
+      }
+      const formula = graph.formulas.get(dependentName);
+      if (!formula) {
+        continue;
+      }
+      visited.add(dependentName);
+      const depth = current.depth + 1;
+      const path = [...current.path, dependentName];
+      impact.push({ formula, depth, path });
+      queue.push({ name: dependentName, depth, path });
+    }
+  }
+  impact.sort(
+    (first, second) => first.depth - second.depth
+      || compareNames(first.formula.name, second.formula.name),
+  );
+  return impact;
 }

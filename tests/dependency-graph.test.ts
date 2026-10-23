@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AppError } from '../src/lib/app-error.ts';
-import { buildGraph, computeLevels } from '../src/lib/dependency-graph.ts';
+import {
+  assertNoMissingInputs,
+  buildGraph,
+  collectMissingInputs,
+  computeLevels,
+  findCyclePath,
+  findImpact,
+} from '../src/lib/dependency-graph.ts';
 
 test('buildGraph separates formula dependencies from record fields', () => {
   const graph = buildGraph(
@@ -116,19 +123,139 @@ test('computeLevels keeps sibling dependencies in one level', () => {
   assert.deepEqual(levels, [['base'], ['left', 'right'], ['total']]);
 });
 
-test('computeLevels rejects a cycle instead of returning partial levels', () => {
+test('findCyclePath returns the exact cycle path', () => {
   const graph = buildGraph(
     [
-      { name: 'a', inputs: ['c'] },
+      { name: 'a', inputs: ['b'] },
+      { name: 'b', inputs: ['c'] },
+      { name: 'c', inputs: ['a'] },
+    ],
+    [],
+  );
+  assert.deepEqual(findCyclePath(graph), ['a', 'b', 'c', 'a']);
+  const prefixed = buildGraph(
+    [
+      { name: 'root', inputs: ['a'] },
+      { name: 'a', inputs: ['b'] },
       { name: 'b', inputs: ['a'] },
-      { name: 'c', inputs: ['b'] },
+    ],
+    [],
+  );
+  assert.deepEqual(findCyclePath(prefixed), ['a', 'b', 'a']);
+});
+
+test('findCyclePath handles a self-loop', () => {
+  const graph = buildGraph([{ name: 'self', inputs: ['self'] }], []);
+  assert.deepEqual(findCyclePath(graph), ['self', 'self']);
+  assert.throws(
+    () => computeLevels(graph),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.deepEqual(error.details, { path: ['self', 'self'] });
+      return true;
+    },
+  );
+});
+
+test('findCyclePath returns null for an acyclic graph', () => {
+  const graph = buildGraph(
+    [
+      { name: 'base', inputs: [] },
+      { name: 'total', inputs: ['base'] },
+    ],
+    [],
+  );
+  assert.equal(findCyclePath(graph), null);
+});
+
+test('computeLevels includes the exact cycle path in the error', () => {
+  const graph = buildGraph(
+    [
+      { name: 'a', inputs: ['b'] },
+      { name: 'b', inputs: ['c'] },
+      { name: 'c', inputs: ['a'] },
     ],
     [],
   );
   assert.throws(
     () => computeLevels(graph),
-    (error: unknown) => error instanceof AppError && error.code === 'DEPENDENCY_CYCLE',
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.code, 'DEPENDENCY_CYCLE');
+      assert.equal(error.message, 'Dependency cycle detected: a -> b -> c -> a');
+      assert.deepEqual(error.details, { path: ['a', 'b', 'c', 'a'] });
+      return true;
+    },
   );
+});
+
+test('collectMissingInputs returns all missing names once', () => {
+  const graph = buildGraph(
+    [
+      { name: 'tax', inputs: ['amount', 'rate', 'commission'] },
+      { name: 'total', inputs: ['tax', 'discount', 'rate'] },
+    ],
+    ['amount'],
+  );
+  assert.deepEqual(collectMissingInputs(graph), ['commission', 'discount', 'rate']);
+  assert.throws(
+    () => assertNoMissingInputs(graph),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.code, 'MISSING_INPUT');
+      assert.deepEqual(error.details, { missing: ['commission', 'discount', 'rate'] });
+      return true;
+    },
+  );
+});
+
+test('assertNoMissingInputs passes when every input is present', () => {
+  const graph = buildGraph(
+    [
+      { name: 'base', inputs: [] },
+      { name: 'total', inputs: ['base', 'amount'] },
+    ],
+    ['amount'],
+  );
+  assert.deepEqual(collectMissingInputs(graph), []);
+  assert.doesNotThrow(() => assertNoMissingInputs(graph));
+});
+
+test('findImpact returns direct and indirect dependents with depth and path', () => {
+  const graph = buildGraph(
+    [
+      { name: 'base', inputs: [] },
+      { name: 'left', inputs: ['base'] },
+      { name: 'right', inputs: ['base'] },
+      { name: 'total', inputs: ['left', 'right'] },
+      { name: 'independent', inputs: [] },
+    ],
+    [],
+  );
+  const impact = findImpact(graph, 'base');
+  assert.deepEqual(impact.map((entry) => entry.formula.name), ['left', 'right', 'total']);
+  assert.deepEqual(impact.map((entry) => entry.depth), [1, 1, 2]);
+  assert.deepEqual(impact.find((entry) => entry.formula.name === 'total')?.path, [
+    'base',
+    'left',
+    'total',
+  ]);
+  assert.equal(impact.filter((entry) => entry.formula.name === 'total').length, 1);
+  assert.deepEqual(findImpact(graph, 'total'), []);
+  assert.deepEqual(findImpact(graph, 'missing'), []);
+});
+
+test('worked example runs commission before tax before total', () => {
+  const graph = buildGraph(
+    [
+      { name: 'total', inputs: ['commission', 'tax'] },
+      { name: 'tax', inputs: ['commission'] },
+      { name: 'commission', inputs: ['amount', 'rate'] },
+    ],
+    ['amount', 'rate'],
+  );
+  const levels = computeLevels(graph).map((level) => level.map((formula) => formula.name));
+  assert.deepEqual(levels, [['commission'], ['tax'], ['total']]);
 });
 
 test('computeLevels returns no levels for an empty graph', () => {

@@ -16,6 +16,7 @@ export type SavedRecord = Record<string, unknown>;
 
 export interface SaveRecordOptions {
   readonly connection?: PoolConnection;
+  readonly expectedVersion?: number;
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -179,6 +180,7 @@ async function prepareRows(
   connection: PoolConnection,
   definition: TableDefinition,
   items: Record<string, unknown>[],
+  expectedVersion?: number,
 ): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
   for (const item of items) {
@@ -194,6 +196,14 @@ async function prepareRows(
     const current = await findCurrent(connection, definition, uuid);
     if (!current) {
       throw new AppError(404, ErrorCodes.NOT_FOUND, 'Record not found', { uuid });
+    }
+    if (
+      expectedVersion !== undefined
+      && Number(current[definition.versionColumn]) !== expectedVersion
+    ) {
+      throw new AppError(409, ErrorCodes.VERSION_CONFLICT, 'A newer version already exists', {
+        current,
+      });
     }
     rows.push(changeValues(item, current, definition));
   }
@@ -247,7 +257,7 @@ export async function saveRecord(
   let preparedRows: Record<string, unknown>[] = [];
   try {
     await connection.beginTransaction();
-    preparedRows = await prepareRows(connection, definition, items);
+    preparedRows = await prepareRows(connection, definition, items, options.expectedVersion);
     const savedRows = await insertRows(connection, definition, preparedRows);
     await connection.commit();
     const first = savedRows[0];
