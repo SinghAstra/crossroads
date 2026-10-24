@@ -1,12 +1,13 @@
 import config from '../config/index.ts';
 import type { FormulaRow } from '../data/formula-repository.ts';
-import { mapWithConcurrency } from '../lib/concurrency.ts';
+import { AppError } from '../lib/app-error.ts';
+import { mapWithConcurrency, type ConcurrencyLimiter } from '../lib/concurrency.ts';
 import {
-  assertNoMissingInputs,
   buildGraph,
   computeLevels,
   type FormulaGraph,
 } from '../lib/dependency-graph.ts';
+import { ErrorCodes } from '../lib/error-codes.ts';
 import { runFormula } from '../lib/formula-runner.ts';
 import type { FormulaRunResult } from '../lib/formula-runner-types.ts';
 import type { PreviewSelection } from './formula-selection-service.ts';
@@ -34,6 +35,14 @@ export interface PreviewExecutionOptions {
   readonly evaluator?: PreviewEvaluator;
   readonly concurrency?: number;
   readonly timeoutMs?: number;
+  readonly limiter?: ConcurrencyLimiter;
+}
+
+export interface PreviewExecutionPlan {
+  readonly selection: readonly PreviewSelection[];
+  readonly graph: FormulaGraph<FormulaRow>;
+  readonly levels: readonly (readonly FormulaRow[])[];
+  readonly selectionByName: ReadonlyMap<string, PreviewSelection>;
 }
 
 interface FormulaEvaluation {
@@ -79,10 +88,13 @@ async function evaluateSelection(
   selection: PreviewSelection,
   values: ReadonlyMap<string, unknown>,
   evaluator: PreviewEvaluator,
+  limiter?: ConcurrencyLimiter,
 ): Promise<FormulaEvaluation> {
   const data = Object.fromEntries(values);
   try {
-    const run = await evaluator(selection.formula.formula_text, data);
+    const run = limiter
+      ? await limiter.run(() => evaluator(selection.formula.formula_text, data))
+      : await evaluator(selection.formula.formula_text, data);
     if (run.status === 'SUCCESS') {
       return {
         outcome: makeOutcome(
@@ -134,43 +146,82 @@ function firstFailedDependency(
   return null;
 }
 
-export function assertPreviewInputs(
-  selection: readonly PreviewSelection[],
-  record: Record<string, unknown>,
-): FormulaGraph<FormulaRow> {
-  const graph = buildGraph(
-    selection.map((item) => item.formula),
-    Object.keys(record),
-  );
-  assertNoMissingInputs(graph);
-  return graph;
+function compareNames(first: string, second: string): number {
+  if (first < second) {
+    return -1;
+  }
+  if (first > second) {
+    return 1;
+  }
+  return 0;
 }
 
-export async function executePreview(
+export function createPreviewPlan(
   selection: readonly PreviewSelection[],
-  record: Record<string, unknown>,
-  options: PreviewExecutionOptions = {},
-): Promise<PreviewFormulaOutcome[]> {
-  const graph = assertPreviewInputs(selection, record);
+): PreviewExecutionPlan {
+  const graph = buildGraph(selection.map((item) => item.formula), []);
   const levels = computeLevels(graph);
-  const evaluator = options.evaluator
-    ?? defaultEvaluator(options.timeoutMs ?? config.formula.timeoutMs);
-  const concurrency = options.concurrency ?? config.formula.previewConcurrency;
   const selectionByName = new Map(
     selection.map((item) => [item.formula.name, item]),
   );
+  return { selection, graph, levels, selectionByName };
+}
+
+export function assertPreviewRecordInputs(
+  plan: PreviewExecutionPlan,
+  record: Record<string, unknown>,
+  recordIndex?: number,
+): void {
+  const recordKeys = new Set(Object.keys(record));
+  const missing = new Set<string>();
+  for (const fields of plan.graph.recordFields.values()) {
+    for (const field of fields) {
+      if (!recordKeys.has(field)) {
+        missing.add(field);
+      }
+    }
+  }
+  if (missing.size === 0) {
+    return;
+  }
+  const names = [...missing].sort(compareNames);
+  const details: Record<string, unknown> = { missing: names };
+  if (recordIndex !== undefined) {
+    details.recordIndex = recordIndex;
+  }
+  throw new AppError(
+    400,
+    ErrorCodes.MISSING_INPUT,
+    `Missing inputs: ${names.join(', ')}`,
+    details,
+  );
+}
+
+export async function executePreviewPlan(
+  plan: PreviewExecutionPlan,
+  record: Record<string, unknown>,
+  options: PreviewExecutionOptions = {},
+): Promise<PreviewFormulaOutcome[]> {
+  assertPreviewRecordInputs(plan, record);
+  const evaluator = options.evaluator
+    ?? defaultEvaluator(options.timeoutMs ?? config.formula.timeoutMs);
+  const concurrency = options.concurrency ?? config.formula.previewConcurrency;
   const outcomes: PreviewFormulaOutcome[] = [];
   const outcomesByName = new Map<string, PreviewFormulaOutcome>();
   const failureRoots = new Map<string, string>();
   const values = new Map<string, unknown>(Object.entries(record));
-  for (const level of levels) {
+  for (const level of plan.levels) {
     const runnable: PreviewSelection[] = [];
     for (const formula of level) {
-      const selected = selectionByName.get(formula.name);
+      const selected = plan.selectionByName.get(formula.name);
       if (!selected) {
         continue;
       }
-      const dependency = firstFailedDependency(formula.name, graph, outcomesByName);
+      const dependency = firstFailedDependency(
+        formula.name,
+        plan.graph,
+        outcomesByName,
+      );
       if (dependency) {
         const root = failureRoots.get(dependency) ?? dependency;
         failureRoots.set(formula.name, root);
@@ -194,7 +245,12 @@ export async function executePreview(
     const evaluations = await mapWithConcurrency(
       runnable,
       concurrency,
-      (selected) => evaluateSelection(selected, values, evaluator),
+      (selected) => evaluateSelection(
+        selected,
+        values,
+        evaluator,
+        options.limiter,
+      ),
     );
     for (const evaluation of evaluations) {
       const outcome = evaluation.outcome;
@@ -213,4 +269,12 @@ export async function executePreview(
     }
   }
   return outcomes;
+}
+
+export async function executePreview(
+  selection: readonly PreviewSelection[],
+  record: Record<string, unknown>,
+  options: PreviewExecutionOptions = {},
+): Promise<PreviewFormulaOutcome[]> {
+  return executePreviewPlan(createPreviewPlan(selection), record, options);
 }
