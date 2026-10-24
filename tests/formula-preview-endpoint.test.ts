@@ -56,6 +56,30 @@ function preview(body: Record<string, unknown>): request.Test {
   return request(app).post('/formulas/preview').send(body);
 }
 
+function changeFormula(
+  formulaUuid: string,
+  version: number,
+  formulaText: string,
+): request.Test {
+  return request(app).post('/formulas').send({ uuid: formulaUuid, version, formulaText });
+}
+
+async function latestInsertedAt(
+  firstUuid: string,
+  secondUuid: string,
+  thirdUuid: string,
+): Promise<Date> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT MAX(inserted_at) AS inserted_at FROM formulas WHERE uuid IN (?, ?, ?)',
+    [firstUuid, secondUuid, thirdUuid],
+  );
+  const value = rows[0]?.inserted_at;
+  if (value instanceof Date) {
+    return value;
+  }
+  return new Date(String(value));
+}
+
 async function runLogs(runUuid: string): Promise<RowDataPacket[]> {
   const [rows] = await pool.query<RowDataPacket[]>(
     'SELECT * FROM formula_runs WHERE run_uuid = ? ORDER BY id ASC',
@@ -73,7 +97,7 @@ function formulaByName(
   return formula;
 }
 
-test('POST /formulas/preview explains results, merges the record, and writes one run log', async () => {
+test('POST /formulas/preview runs the worked example created in reverse dependency order', async () => {
   const prefix = uniqueName('preview_example');
   const commissionName = `${prefix}_commission`;
   const taxName = `${prefix}_tax`;
@@ -171,7 +195,92 @@ test('POST /formulas/preview explains results, merges the record, and writes one
   assert.match(String(logs[2]?.calculation_text), /return EXTERNAL_VAR\..*_commission \+ EXTERNAL_VAR\..*_tax/);
 });
 
-test('POST /formulas/preview returns 200 and logs FAILED and SKIPPED formulas', async () => {
+test('POST /formulas/preview uses the historical snapshot when asOf is provided', async () => {
+  const prefix = uniqueName('preview_asof');
+  const commissionName = `${prefix}_commission`;
+  const taxName = `${prefix}_tax`;
+  const totalName = `${prefix}_total`;
+  const commissionText = 'return EXTERNAL_VAR.amount * EXTERNAL_VAR.rate / 100';
+  const taxText = `return EXTERNAL_VAR.${commissionName} * 0.18`;
+  const changedTaxText = `return EXTERNAL_VAR.${commissionName} * 0.20`;
+  const totalText = `return EXTERNAL_VAR.${commissionName} + EXTERNAL_VAR.${taxName}`;
+  const total = await createFormula(totalName, totalText);
+  assert.equal(total.status, 200);
+  const tax = await createFormula(taxName, taxText);
+  assert.equal(tax.status, 200);
+  const commission = await createFormula(commissionName, commissionText);
+  assert.equal(commission.status, 200);
+  const historicalTimestamp = await latestInsertedAt(
+    total.body.uuid,
+    tax.body.uuid,
+    commission.body.uuid,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const changed = await changeFormula(tax.body.uuid, 1, changedTaxText);
+  assert.equal(changed.status, 200);
+  assert.equal(changed.body.version, 2);
+  assert.ok(
+    new Date(String(changed.body.inserted_at)).getTime() > historicalTimestamp.getTime(),
+  );
+  const record = { amount: 2000, rate: 10 };
+  const historical = await preview({
+    record,
+    formulaUuids: [total.body.uuid],
+    asOf: historicalTimestamp.toISOString(),
+  });
+  assert.equal(historical.status, 200);
+  const historicalBody = historical.body as {
+    runUuid: string;
+    record: Record<string, unknown>;
+    formulas: FormulaExplanation[];
+  };
+  assert.equal(historicalBody.record[commissionName], 200);
+  assert.equal(historicalBody.record[taxName], 36);
+  assert.equal(historicalBody.record[totalName], 236);
+  const historicalTax = formulaByName(historicalBody.formulas, taxName);
+  assert.equal(historicalTax.version, 1);
+  assert.equal(historicalTax.result, 36);
+  assert.equal(historicalTax.steps.formula, taxText);
+  const historicalLogs = await runLogs(historicalBody.runUuid);
+  assert.equal(historicalLogs.length, 3);
+  assert.equal(Number(historicalLogs[2]?.id), Number(historicalLogs[0]?.id) + 2);
+  assert.deepEqual(
+    historicalLogs.map((row) => row.formula_name),
+    [commissionName, taxName, totalName],
+  );
+  assert.deepEqual(
+    historicalLogs.map((row) => Number(row.formula_version)),
+    [1, 1, 1],
+  );
+  assert.deepEqual(historicalLogs.map((row) => row.result), [200, 36, 236]);
+  const current = await preview({
+    record,
+    formulaUuids: [total.body.uuid],
+  });
+  assert.equal(current.status, 200);
+  const currentBody = current.body as {
+    runUuid: string;
+    record: Record<string, unknown>;
+    formulas: FormulaExplanation[];
+  };
+  assert.equal(currentBody.record[commissionName], 200);
+  assert.equal(currentBody.record[taxName], 40);
+  assert.equal(currentBody.record[totalName], 240);
+  const currentTax = formulaByName(currentBody.formulas, taxName);
+  assert.equal(currentTax.version, 2);
+  assert.equal(currentTax.result, 40);
+  assert.equal(currentTax.steps.formula, changedTaxText);
+  const currentLogs = await runLogs(currentBody.runUuid);
+  assert.equal(currentLogs.length, 3);
+  assert.equal(Number(currentLogs[2]?.id), Number(currentLogs[0]?.id) + 2);
+  assert.deepEqual(
+    currentLogs.map((row) => Number(row.formula_version)),
+    [1, 2, 1],
+  );
+  assert.deepEqual(currentLogs.map((row) => row.result), [200, 40, 240]);
+});
+
+test('POST /formulas/preview isolates failures and returns FAILED, SKIPPED, and SUCCESS', async () => {
   const prefix = uniqueName('preview_failure');
   const slowName = `${prefix}_slow`;
   const dependentName = `${prefix}_dependent`;
