@@ -7,6 +7,8 @@ import {
   rollbackFormulaBodySchema,
 } from '../validation/formula-schemas.ts';
 import { previewBodySchema } from '../validation/preview-schemas.ts';
+import { bulkPreviewBodySchema } from '../validation/bulk-preview-schemas.ts';
+import { previewFormulasBulk } from '../services/formula-bulk-preview-service.ts';
 import { previewFormulas } from '../services/formula-preview-service.ts';
 import {
   getFormulaHistory,
@@ -128,6 +130,20 @@ export async function previewFormula(
   try {
     const body = previewBodySchema.parse(req.body);
     const preview = await previewFormulas(body);
+    res.status(200).json(preview);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function previewBulkFormulas(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = bulkPreviewBodySchema.parse(req.body);
+    const preview = await previewFormulasBulk(body);
     res.status(200).json(preview);
   } catch (error) {
     next(error);

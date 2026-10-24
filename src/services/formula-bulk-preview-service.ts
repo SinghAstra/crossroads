@@ -20,6 +20,11 @@ import {
   type PreviewFormulaExplanation,
 } from './formula-preview-response-service.ts';
 import {
+  writeBulkRunLog,
+  type BulkRunLogRecord,
+  type BulkRunLogWriter,
+} from './formula-run-log-service.ts';
+import {
   resolvePreviewSelection,
   type PreviewSelection,
 } from './formula-selection-service.ts';
@@ -39,27 +44,61 @@ export interface BulkPreviewOptions {
   readonly recordConcurrency?: number;
   readonly formulaConcurrency?: number;
   readonly previewConcurrency?: number;
+  readonly writeLog?: BulkRunLogWriter;
 }
 
-export interface BulkPreviewRecordResult {
+export interface BulkPreviewResult {
   readonly recordIndex: number;
   readonly runUuid: string;
-  readonly inputRecord: Record<string, unknown>;
   readonly record: Record<string, unknown>;
   readonly formulas: PreviewFormulaExplanation[];
-  readonly outcomes: readonly PreviewFormulaOutcome[];
-  readonly durationMs: number;
+  readonly status: 'SUCCESS' | 'FAILED';
 }
 
-export interface BulkPreviewExecution {
-  readonly records: BulkPreviewRecordResult[];
+export interface BulkPreviewSummary {
+  readonly totalRecords: number;
+  readonly totalFormulas: number;
   readonly totalMs: number;
+  readonly avgMsPerRecord: number;
+  readonly failedRecords: number;
+  readonly failedFormulas: number;
+  readonly skippedFormulas: number;
+}
+
+export interface BulkPreviewResponse {
+  readonly results: BulkPreviewResult[];
+  readonly summary: BulkPreviewSummary;
+}
+
+interface BulkPreviewRecordExecution extends BulkRunLogRecord {
+  readonly record: Record<string, unknown>;
+  readonly formulas: PreviewFormulaExplanation[];
+}
+
+function recordStatus(
+  outcomes: readonly PreviewFormulaOutcome[],
+): 'SUCCESS' | 'FAILED' {
+  return outcomes.some((outcome) => outcome.status !== 'SUCCESS')
+    ? 'FAILED'
+    : 'SUCCESS';
+}
+
+function countOutcomes(
+  records: readonly BulkPreviewRecordExecution[],
+  status: PreviewFormulaOutcome['status'],
+): number {
+  return records.reduce(
+    (total, record) => total + record.outcomes.filter(
+      (outcome) => outcome.status === status,
+    ).length,
+    0,
+  );
 }
 
 export async function previewFormulasBulk(
   body: BulkPreviewBody,
   options: BulkPreviewOptions = {},
-): Promise<BulkPreviewExecution> {
+): Promise<BulkPreviewResponse> {
   const started = performance.now();
   const snapshot = await (options.loadSnapshot ?? loadPreviewSnapshot)(body.asOf);
   const selection = resolvePreviewSelection(snapshot, body.formulaUuids);
@@ -77,7 +116,6 @@ export async function previewFormulasBulk(
     body.records,
     options.recordConcurrency ?? config.formula.bulkRecordConcurrency,
     async (record, index) => {
-      const recordStarted = performance.now();
       const outcomes = await executePreviewPlan(plan, record, {
         ...(options.evaluator ? { evaluator: options.evaluator } : {}),
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
@@ -88,14 +126,38 @@ export async function previewFormulasBulk(
       const response = buildPreviewResponse(runUuid, record, outcomes);
       return {
         recordIndex: index,
-        ...response,
+        runUuid,
+        record: response.record,
+        formulas: response.formulas,
         outcomes,
-        durationMs: Number((performance.now() - recordStarted).toFixed(2)),
       };
     },
   );
+  await (options.writeLog ?? writeBulkRunLog)(records);
+  const results: BulkPreviewResult[] = records.map((record) => ({
+    recordIndex: record.recordIndex,
+    runUuid: record.runUuid,
+    record: record.record,
+    formulas: record.formulas,
+    status: recordStatus(record.outcomes),
+  }));
+  const totalFormulas = records.reduce(
+    (total, record) => total + record.outcomes.length,
+    0,
+  );
+  const totalMs = Number((performance.now() - started).toFixed(2));
   return {
-    records,
-    totalMs: Number((performance.now() - started).toFixed(2)),
+    results,
+    summary: {
+      totalRecords: results.length,
+      totalFormulas,
+      totalMs,
+      avgMsPerRecord: results.length === 0
+        ? 0
+        : Number((totalMs / results.length).toFixed(2)),
+      failedRecords: results.filter((result) => result.status === 'FAILED').length,
+      failedFormulas: countOutcomes(records, 'FAILED'),
+      skippedFormulas: countOutcomes(records, 'SKIPPED'),
+    },
   };
 }

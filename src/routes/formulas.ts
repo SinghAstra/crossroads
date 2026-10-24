@@ -4,6 +4,7 @@ import {
   formulaHistory,
   formulaImpact,
   listFormulas,
+  previewBulkFormulas,
   previewFormula,
   rollbackFormula,
   saveFormula,
@@ -13,6 +14,7 @@ const router = Router();
 
 router.post('/', saveFormula);
 router.post('/preview', previewFormula);
+router.post('/preview/bulk', previewBulkFormulas);
 router.post('/:uuid/deactivate', deactivateFormula);
 router.post('/:uuid/rollback', rollbackFormula);
 router.get('/', listFormulas);

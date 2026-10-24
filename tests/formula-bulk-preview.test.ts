@@ -8,8 +8,14 @@ import {
   createPreviewPlan,
   executePreview,
   type PreviewEvaluator,
+  type PreviewFormulaOutcome,
 } from '../src/services/formula-execution-service.ts';
 import { buildPreviewResponse } from '../src/services/formula-preview-response-service.ts';
+import {
+  BULK_LOG_CHUNK_SIZE,
+  writeBulkRunLog,
+  type BulkRunLogRecord,
+} from '../src/services/formula-run-log-service.ts';
 import {
   resolvePreviewSelection,
   type PreviewSelection,
@@ -46,6 +52,22 @@ function success(result: unknown): FormulaRunResult {
 
 function failure(error: string): FormulaRunResult {
   return { status: 'FAILED', result: null, error, calculation: 'return 1', durationMs: 1 };
+}
+
+async function ignoreLogs(): Promise<void> {}
+
+function outcome(name: string): PreviewFormulaOutcome {
+  return {
+    formula: formulaRow(name, []),
+    autoAdded: false,
+    status: 'SUCCESS',
+    result: 1,
+    error: null,
+    reason: null,
+    calculation: 'return 1',
+    durationMs: 1,
+    inputData: { amount: 1 },
+  };
 }
 
 function workedExampleSnapshot(): FormulaRow[] {
@@ -169,13 +191,14 @@ test('previewFormulasBulk loads the snapshot and builds the plan once', async ()
       },
       createPlan,
       evaluator: workedExampleEvaluator(),
+      writeLog: ignoreLogs,
     },
   );
   assert.equal(snapshotCalls, 1);
   assert.equal(planCalls, 1);
   assert.equal(seenAsOf?.toISOString(), asOf.toISOString());
-  assert.equal(execution.records.length, 3);
-  for (const [index, result] of execution.records.entries()) {
+  assert.equal(execution.results.length, 3);
+  for (const [index, result] of execution.results.entries()) {
     assert.equal(result.recordIndex, index);
     assert.deepEqual(
       result.formulas.map((formula) => formula.name),
@@ -184,13 +207,24 @@ test('previewFormulasBulk loads the snapshot and builds the plan once', async ()
     assert.ok(result.formulas.every((formula) => formula.status === 'SUCCESS'));
   }
   assert.deepEqual(
-    execution.records.map((result) => result.record),
+    execution.results.map((result) => result.record),
     [
       { amount: 2000, rate: 10, commission: 200, tax: 36, total: 236 },
       { amount: 1000, rate: 5, commission: 50, tax: 9, total: 59 },
       { amount: 500, rate: 20, commission: 100, tax: 18, total: 118 },
     ],
   );
+  assert.deepEqual(execution.summary, {
+    totalRecords: 3,
+    totalFormulas: 9,
+    totalMs: execution.summary.totalMs,
+    avgMsPerRecord: execution.summary.avgMsPerRecord,
+    failedRecords: 0,
+    failedFormulas: 0,
+    skippedFormulas: 0,
+  });
+  assert.ok(execution.summary.totalMs >= 0);
+  assert.ok(execution.summary.avgMsPerRecord >= 0);
 });
 
 test('previewFormulasBulk matches the single-preview explanations', async () => {
@@ -205,11 +239,11 @@ test('previewFormulasBulk matches the single-preview explanations', async () => 
     {
       loadSnapshot: async () => snapshot,
       evaluator,
+      writeLog: ignoreLogs,
     },
   );
-  const result = bulk.records[0];
+  const result = bulk.results[0];
   assert.ok(result);
-  assert.deepEqual(result.inputRecord, single.inputRecord);
   assert.deepEqual(result.record, single.record);
   assert.deepEqual(result.formulas, single.formulas);
   assert.notEqual(result.runUuid, single.runUuid);
@@ -231,6 +265,7 @@ test('previewFormulasBulk rejects missing inputs before evaluating any record', 
           calls += 1;
           return success(1);
         },
+        writeLog: ignoreLogs,
       },
     ),
     (error: unknown) => {
@@ -262,10 +297,11 @@ test('previewFormulasBulk isolates failures per record', async () => {
     {
       loadSnapshot: async () => [fail, dependent, independent],
       evaluator,
+      writeLog: ignoreLogs,
     },
   );
-  const failedRecord = execution.records[0];
-  const successfulRecord = execution.records[1];
+  const failedRecord = execution.results[0];
+  const successfulRecord = execution.results[1];
   assert.ok(failedRecord);
   assert.ok(successfulRecord);
   assert.deepEqual(
@@ -323,13 +359,14 @@ test('previewFormulasBulk bounds record and formula concurrency', async () => {
       recordConcurrency: 2,
       formulaConcurrency: 3,
       previewConcurrency: 4,
+      writeLog: ignoreLogs,
     },
   );
   assert.equal(maxActiveFormulas, 3);
   assert.equal(maxActiveRecords, 2);
-  assert.equal(execution.records.length, 4);
-  assert.ok(execution.records.every((record) => record.formulas.length === 4));
-  assert.ok(execution.records.every(
+  assert.equal(execution.results.length, 4);
+  assert.ok(execution.results.every((record) => record.formulas.length === 4));
+  assert.ok(execution.results.every(
     (record) => record.formulas.every((formula) => formula.status === 'SUCCESS'),
   ));
 });
@@ -337,12 +374,48 @@ test('previewFormulasBulk bounds record and formula concurrency', async () => {
 test('previewFormulasBulk supports an empty formula selection', async () => {
   const execution = await previewFormulasBulk(
     { records: [{ amount: 2000 }], formulaUuids: [] },
-    { loadSnapshot: async () => workedExampleSnapshot() },
+    {
+      loadSnapshot: async () => workedExampleSnapshot(),
+      writeLog: ignoreLogs,
+    },
   );
-  const result = execution.records[0];
+  const result = execution.results[0];
   assert.ok(result);
   assert.deepEqual(result.formulas, []);
-  assert.deepEqual(result.inputRecord, { amount: 2000 });
   assert.deepEqual(result.record, { amount: 2000 });
   assert.ok(result.runUuid.length > 0);
+  assert.equal(execution.summary.totalFormulas, 0);
+  assert.equal(execution.summary.failedRecords, 0);
+});
+
+test('writeBulkRunLog batches rows and preserves each record grouping', async () => {
+  const records: BulkRunLogRecord[] = Array.from(
+    { length: 60 },
+    (_, recordIndex) => ({
+      runUuid: `run-${recordIndex}`,
+      recordIndex,
+      outcomes: Array.from({ length: 10 }, (_, formulaIndex) => (
+        outcome(`formula_${formulaIndex}`)
+      )),
+    }),
+  );
+  const chunks: Record<string, unknown>[][] = [];
+  await writeBulkRunLog(records, async (rows) => {
+    chunks.push(rows);
+    return [];
+  });
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0]?.length, BULK_LOG_CHUNK_SIZE);
+  assert.equal(chunks[1]?.length, 100);
+  const first = chunks[0]?.[0];
+  assert.equal(first?.run_uuid, 'run-0');
+  assert.equal(first?.record_index, 0);
+  assert.equal(first?.formula_name, 'formula_0');
+  const lastOfFirstChunk = chunks[0]?.[BULK_LOG_CHUNK_SIZE - 1];
+  assert.equal(lastOfFirstChunk?.run_uuid, 'run-49');
+  assert.equal(lastOfFirstChunk?.record_index, 49);
+  assert.equal(lastOfFirstChunk?.formula_name, 'formula_9');
+  const firstOfSecondChunk = chunks[1]?.[0];
+  assert.equal(firstOfSecondChunk?.run_uuid, 'run-50');
+  assert.equal(firstOfSecondChunk?.record_index, 50);
 });
