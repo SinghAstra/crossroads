@@ -4,6 +4,7 @@ import {
   formulaHistory,
   formulaImpact,
   listFormulas,
+  previewFormula,
   rollbackFormula,
   saveFormula,
 } from '../controllers/formula-controller.ts';
@@ -11,6 +12,7 @@ import {
 const router = Router();
 
 router.post('/', saveFormula);
+router.post('/preview', previewFormula);
 router.post('/:uuid/deactivate', deactivateFormula);
 router.post('/:uuid/rollback', rollbackFormula);
 router.get('/', listFormulas);

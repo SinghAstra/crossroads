@@ -22,6 +22,7 @@ export interface PreviewFormulaOutcome {
   readonly reason: string | null;
   readonly calculation: string | null;
   readonly durationMs: number;
+  readonly inputData: Record<string, unknown>;
 }
 
 export type PreviewEvaluator = (
@@ -59,6 +60,7 @@ function makeOutcome(
   reason: string | null,
   calculation: string | null,
   durationMs: number,
+  inputData: Record<string, unknown>,
 ): PreviewFormulaOutcome {
   return {
     formula: selection.formula,
@@ -69,6 +71,7 @@ function makeOutcome(
     reason,
     calculation,
     durationMs,
+    inputData,
   };
 }
 
@@ -90,6 +93,7 @@ async function evaluateSelection(
           null,
           run.calculation,
           run.durationMs,
+          data,
         ),
         rawResult: run.result,
       };
@@ -103,13 +107,14 @@ async function evaluateSelection(
         null,
         run.calculation,
         run.durationMs,
+        data,
       ),
       rawResult: null,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Formula evaluation failed';
     return {
-      outcome: makeOutcome(selection, 'FAILED', null, message, null, null, 0),
+      outcome: makeOutcome(selection, 'FAILED', null, message, null, null, 0, data),
       rawResult: null,
     };
   }
@@ -179,6 +184,7 @@ export async function executePreview(
             `dependency ${root} failed`,
             null,
             0,
+            Object.fromEntries(values),
           ),
         );
         continue;

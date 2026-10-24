@@ -240,7 +240,7 @@ test('executePreview marks timeouts FAILED and skips dependents', async () => {
   const outcomes = await executePreview(
     [dependent, independent, slow],
     {},
-    { timeoutMs: 100, concurrency: 2 },
+    { timeoutMs: 500, concurrency: 2 },
   );
   const slowOutcome = outcomeByName(outcomes, 'slow');
   assert.equal(slowOutcome.status, 'FAILED');

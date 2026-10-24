@@ -6,6 +6,8 @@ import {
   formulaUuidParamsSchema,
   rollbackFormulaBodySchema,
 } from '../validation/formula-schemas.ts';
+import { previewBodySchema } from '../validation/preview-schemas.ts';
+import { previewFormulas } from '../services/formula-preview-service.ts';
 import {
   getFormulaHistory,
   getFormulaImpact,
@@ -113,6 +115,20 @@ export async function formulaImpact(
     const params = formulaUuidParamsSchema.parse(req.params);
     const impact = await getFormulaImpact(params.uuid);
     res.status(200).json(impact);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function previewFormula(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = previewBodySchema.parse(req.body);
+    const preview = await previewFormulas(body);
+    res.status(200).json(preview);
   } catch (error) {
     next(error);
   }
