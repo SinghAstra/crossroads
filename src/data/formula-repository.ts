@@ -63,6 +63,21 @@ export async function listActiveFormulas(): Promise<FormulaRow[]> {
   return rows.map((row) => normalizeFormulaRow(row));
 }
 
+export async function listActiveFormulasAsOf(asOf: Date): Promise<FormulaRow[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `WITH ranked AS (
+      SELECT ${formulaColumns}, ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY id DESC) AS row_rank
+      FROM formulas
+      WHERE inserted_at <= ?
+    )
+    SELECT ${formulaColumns} FROM ranked
+    WHERE row_rank = 1 AND status = 'ACTIVE'
+    ORDER BY name ASC, uuid ASC`,
+    [asOf],
+  );
+  return rows.map((row) => normalizeFormulaRow(row));
+}
+
 export async function findCurrentFormula(uuid: string): Promise<FormulaRow | null> {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT ${formulaColumns} FROM current_formulas_window WHERE uuid = ? LIMIT 1`,

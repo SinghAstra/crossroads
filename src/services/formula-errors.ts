@@ -6,6 +6,15 @@ export function formulaNotFound(uuid: string): AppError {
   return new AppError(404, ErrorCodes.NOT_FOUND, 'Formula not found', { uuid });
 }
 
+export function formulasNotFound(uuids: readonly string[]): AppError {
+  return new AppError(
+    404,
+    ErrorCodes.NOT_FOUND,
+    'One or more formulas were not found in the snapshot',
+    { uuids },
+  );
+}
+
 export function formulaVersionConflict(current: FormulaRow): AppError {
   return new AppError(
     409,
