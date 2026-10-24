@@ -103,6 +103,14 @@ test('executePreview rounds output results while dependents receive raw values',
   assert.equal(outcomes[1]?.result, 123.4);
 });
 
+test('executePreview rounds 0.1 plus 0.2 to 0.3 at the output boundary', async () => {
+  const sum = selection(formulaRow('sum', [], 'return 0.1 + 0.2'));
+  const [outcome] = await executePreview([sum], {});
+  assert.equal(outcome?.status, 'SUCCESS');
+  assert.equal(outcome?.result, 0.3);
+  assert.notEqual(outcome?.result, 0.30000000000000004);
+});
+
 test('executePreview normalizes failed formula results', async () => {
   const failed = selection(formulaRow('failed', [], 'failed'));
   const evaluator: PreviewEvaluator = async () => failure('bad formula', 'failed calculation', 4);

@@ -149,6 +149,26 @@ test('POST /formulas changes a formula and keeps the old version', async () => {
   assert.equal(response.body.uuid, created.body.uuid);
   assert.equal(response.body.version, 2);
   assert.equal(response.body.formula_text, `return EXTERNAL_VAR.${commission} * 0.12`);
+  const list = await request(app).get('/formulas');
+  assert.equal(list.status, 200);
+  const listed = list.body.find(
+    (row: { uuid: string }) => row.uuid === created.body.uuid,
+  );
+  assert.equal(listed.version, 2);
+  assert.equal(listed.formula_text, `return EXTERNAL_VAR.${commission} * 0.12`);
+  const history = await request(app).get(`/formulas/${created.body.uuid}/history`);
+  assert.equal(history.status, 200);
+  assert.deepEqual(
+    history.body.map((row: { version: number }) => row.version),
+    [1, 2],
+  );
+  assert.deepEqual(
+    history.body.map((row: { formula_text: string }) => row.formula_text),
+    [
+      `return EXTERNAL_VAR.${commission} * 0.18`,
+      `return EXTERNAL_VAR.${commission} * 0.12`,
+    ],
+  );
   const [rows] = await pool.query<RowDataPacket[]>(
     'SELECT version, formula_text FROM formulas WHERE uuid = ? ORDER BY version ASC',
     [created.body.uuid],
