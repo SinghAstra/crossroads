@@ -4,42 +4,30 @@ import { extractInputs } from '../lib/formula-inputs.ts';
 import type { FormulaSnapshot } from '../lib/formula-types.ts';
 import {
   findCurrentFormula,
+  findFormulaVersion,
   listActiveFormulas,
   normalizeFormulaRow,
   type FormulaRow,
 } from '../data/formula-repository.ts';
 import { saveRecord } from '../data/save-record.ts';
-import type { ChangeFormulaBody, CreateFormulaBody } from '../validation/formula-schemas.ts';
+import type {
+  ChangeFormulaBody,
+  CreateFormulaBody,
+  DeactivateFormulaBody,
+  RollbackFormulaBody,
+} from '../validation/formula-schemas.ts';
+import {
+  formulaNotFound,
+  formulaVersionConflict,
+  formulaVersionNotFound,
+  normalizeFormulaVersionConflict,
+} from './formula-errors.ts';
 import {
   assertActiveNameAvailable,
   assertNoDependentBreakage,
   assertSaveGraphAcyclic,
   validateFormulaSample,
 } from './formula-rules.ts';
-
-function versionConflict(current: FormulaRow): AppError {
-  return new AppError(
-    409,
-    ErrorCodes.VERSION_CONFLICT,
-    'A newer version already exists',
-    { current },
-  );
-}
-
-function normalizeVersionConflict(error: unknown): unknown {
-  if (error instanceof AppError && error.code === ErrorCodes.VERSION_CONFLICT) {
-    const details = error.details as { current?: Record<string, unknown> } | null;
-    if (details?.current) {
-      return new AppError(
-        409,
-        ErrorCodes.VERSION_CONFLICT,
-        error.message,
-        { current: normalizeFormulaRow(details.current) },
-      );
-    }
-  }
-  return error;
-}
 
 function createSnapshot(body: CreateFormulaBody): FormulaSnapshot {
   return {
@@ -74,10 +62,10 @@ export async function createFormula(body: CreateFormulaBody): Promise<FormulaRow
 export async function changeFormula(body: ChangeFormulaBody): Promise<FormulaRow> {
   const current = await findCurrentFormula(body.uuid);
   if (!current) {
-    throw new AppError(404, ErrorCodes.NOT_FOUND, 'Formula not found', { uuid: body.uuid });
+    throw formulaNotFound(body.uuid);
   }
   if (current.version !== body.version) {
-    throw versionConflict(current);
+    throw formulaVersionConflict(current);
   }
   const active = await listActiveFormulas();
   const formulaText = body.formulaText ?? current.formula_text;
@@ -110,6 +98,103 @@ export async function changeFormula(body: ChangeFormulaBody): Promise<FormulaRow
     );
     return normalizeFormulaRow(saved);
   } catch (error) {
-    throw normalizeVersionConflict(error);
+    throw normalizeFormulaVersionConflict(error);
+  }
+}
+
+export async function deactivateFormula(
+  uuid: string,
+  body: DeactivateFormulaBody,
+): Promise<FormulaRow> {
+  const current = await findCurrentFormula(uuid);
+  if (!current) {
+    throw formulaNotFound(uuid);
+  }
+  if (current.version !== body.version) {
+    throw formulaVersionConflict(current);
+  }
+  if (current.status === 'INACTIVE') {
+    return current;
+  }
+  const active = await listActiveFormulas();
+  assertNoDependentBreakage(active, current.name, body.force ?? false);
+  try {
+    const saved = await saveRecord(
+      'formulas',
+      { uuid: current.uuid, status: 'INACTIVE' },
+      { expectedVersion: body.version },
+    );
+    return normalizeFormulaRow(saved);
+  } catch (error) {
+    throw normalizeFormulaVersionConflict(error);
+  }
+}
+
+export async function rollbackFormula(
+  uuid: string,
+  body: RollbackFormulaBody,
+): Promise<FormulaRow> {
+  const current = await findCurrentFormula(uuid);
+  if (!current) {
+    throw formulaNotFound(uuid);
+  }
+  if (current.version !== body.version) {
+    throw formulaVersionConflict(current);
+  }
+  if (body.targetVersion >= current.version) {
+    throw new AppError(
+      400,
+      ErrorCodes.VALIDATION_ERROR,
+      'targetVersion must be older than the current version',
+      { targetVersion: body.targetVersion, currentVersion: current.version },
+    );
+  }
+  const target = await findFormulaVersion(uuid, body.targetVersion);
+  if (!target) {
+    throw formulaVersionNotFound(uuid, body.targetVersion);
+  }
+  if (target.status === 'INACTIVE' && !body.force) {
+    throw new AppError(
+      400,
+      ErrorCodes.VALIDATION_ERROR,
+      'Rolling back to an inactive version requires force',
+      { targetVersion: target.version, status: target.status },
+    );
+  }
+  const active = await listActiveFormulas();
+  const proposed: FormulaSnapshot = {
+    uuid: current.uuid,
+    version: current.version,
+    name: target.name,
+    formula_text: target.formula_text,
+    status: target.status,
+    inputs: target.inputs,
+  };
+  if (proposed.status === 'ACTIVE') {
+    assertActiveNameAvailable(active, proposed.name, current.uuid);
+  }
+  await validateFormulaSample(active, proposed);
+  assertSaveGraphAcyclic(active, proposed);
+  if (
+    current.status === 'ACTIVE'
+    && (proposed.status === 'INACTIVE' || proposed.name !== current.name)
+  ) {
+    assertNoDependentBreakage(active, current.name, body.force ?? false);
+  }
+  try {
+    const saved = await saveRecord(
+      'formulas',
+      {
+        uuid: current.uuid,
+        name: proposed.name,
+        formula_text: proposed.formula_text,
+        status: proposed.status,
+        inputs: proposed.inputs,
+      },
+      { expectedVersion: body.version },
+    );
+    return normalizeFormulaRow(saved);
+  } catch (error) {
+    throw normalizeFormulaVersionConflict(error);
   }
 }

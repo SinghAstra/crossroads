@@ -71,3 +71,30 @@ export async function findCurrentFormula(uuid: string): Promise<FormulaRow | nul
   const row = rows[0];
   return row ? normalizeFormulaRow(row) : null;
 }
+
+export async function listCurrentFormulas(): Promise<FormulaRow[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT ${formulaColumns} FROM current_formulas_window ORDER BY name ASC, uuid ASC`,
+  );
+  return rows.map((row) => normalizeFormulaRow(row));
+}
+
+export async function findFormulaHistory(uuid: string): Promise<FormulaRow[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT ${formulaColumns} FROM formulas WHERE uuid = ? ORDER BY version ASC`,
+    [uuid],
+  );
+  return rows.map((row) => normalizeFormulaRow(row));
+}
+
+export async function findFormulaVersion(
+  uuid: string,
+  version: number,
+): Promise<FormulaRow | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT ${formulaColumns} FROM formulas WHERE uuid = ? AND version = ? LIMIT 1`,
+    [uuid, version],
+  );
+  const row = rows[0];
+  return row ? normalizeFormulaRow(row) : null;
+}

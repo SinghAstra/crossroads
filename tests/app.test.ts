@@ -1,8 +1,10 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import express from 'express';
 import request from 'supertest';
 import { createApp } from '../src/app.ts';
 import { closePool } from '../src/data/close-pool.ts';
+import { errorHandler } from '../src/lib/error-handler.ts';
 
 const app = createApp();
 
@@ -32,4 +34,23 @@ test('malformed JSON uses the standard error envelope', async () => {
   assert.equal(response.status, 400);
   assert.equal(response.body.error.code, 'INVALID_JSON');
   assert.equal(response.body.error.details, null);
+});
+
+test('unexpected errors use the standard 500 envelope', async () => {
+  const failing = express();
+  failing.get('/boom', () => {
+    throw new Error('boom');
+  });
+  failing.use(errorHandler);
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    const response = await request(failing).get('/boom');
+    assert.equal(response.status, 500);
+    assert.equal(response.body.error.code, 'INTERNAL_ERROR');
+    assert.equal(response.body.error.message, 'An unexpected error occurred');
+    assert.equal(response.body.error.details, null);
+  } finally {
+    console.error = original;
+  }
 });
